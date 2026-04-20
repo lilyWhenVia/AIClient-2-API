@@ -68,4 +68,13 @@ Write-Host "Server will start at http://localhost:3000"
 Write-Host "Press Ctrl+C to stop the server"
 Write-Host ""
 
+# Apply local patches before starting
+Write-Host ""
+Write-Host "[PATCH] Applying local patches..." -ForegroundColor Yellow
+node pre-start-patch.js
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Patch script failed, but continuing startup..."
+}
+Write-Host ""
+
 node src\core\master.js

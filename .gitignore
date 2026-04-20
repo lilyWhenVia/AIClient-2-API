@@ -17,3 +17,5 @@ api-potluck-data.json
 model-usage-stats.json
 AGENTS.md
 
+
+pre-start-patch.js
