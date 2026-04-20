@@ -1,13 +1,13 @@
 /**
- * 主进程 (Master Process)
+ * 主进�?(Master Process)
  * 
  * 负责管理子进程的生命周期，包括：
- * - 启动子进程
- * - 监控子进程状态
- * - 处理子进程重启请求
+ * - 启动子进�?
+ * - 监控子进程状�?
+ * - 处理子进程重启请�?
  * - 提供 IPC 通信
  * 
- * 使用方式：
+ * 使用方式�?
  * node src/core/master.js [原有的命令行参数]
  */
 
@@ -17,14 +17,16 @@ import * as http from 'http';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { isRetryableNetworkError } from '../utils/common.js';
+import * as fs from 'fs';
+import * as os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// 子进程实例
+// 子进程实�?
 let workerProcess = null;
 
-// 子进程状态
+// 子进程状�?
 let workerStatus = {
     pid: null,
     startTime: null,
@@ -38,17 +40,127 @@ const config = {
     workerScript: path.join(__dirname, '../services/api-server.js'),
     maxRestartAttempts: 10,
     restartDelay: 1000, // 重启延迟（毫秒）
-    masterPort: parseInt(process.env.MASTER_PORT) || 3100, // 主进程管理端口
+    masterPort: parseInt(process.env.MASTER_PORT) || 3100, // 主进程管理端�?
     args: process.argv.slice(2) // 传递给子进程的参数
 };
 
 /**
- * 启动子进程
+ * 启动子进�?
  */
-function startWorker() {
+/**
+ * Sync Kiro credentials from IDE source files and reset pool health status.
+ * This replaces the external pre-start-patch.cjs script with native logic.
+ */
+async function syncKiroCredentials() {
+    const rootDir = path.join(__dirname, '../..');
+
+    // Step 1: Sync Kiro token from IDE source (~/.aws/sso/cache/)
+    const kiroCacheDir = path.join(os.homedir(), '.aws', 'sso', 'cache');
+    try {
+        const cacheFiles = fs.readdirSync(kiroCacheDir).filter(f => f.endsWith('.json'));
+
+        // Find token source (has accessToken + refreshToken), prefer most recently modified
+        let tokenContent = null;
+        let tokenName = null;
+        let latestMtime = 0;
+        for (const f of cacheFiles) {
+            const fp = path.join(kiroCacheDir, f);
+            try {
+                const stat = fs.statSync(fp);
+                const c = JSON.parse(fs.readFileSync(fp, 'utf8'));
+                if (c.accessToken && c.refreshToken && stat.mtimeMs > latestMtime) {
+                    tokenContent = c;
+                    tokenName = f;
+                    latestMtime = stat.mtimeMs;
+                }
+            } catch { /* skip */ }
+        }
+
+        // Find clientId + clientSecret from a separate hash file
+        let clientId = null, clientSecret = null;
+        for (const f of cacheFiles) {
+            try {
+                const c = JSON.parse(fs.readFileSync(path.join(kiroCacheDir, f), 'utf8'));
+                if (c.clientId && c.clientSecret) {
+                    clientId = c.clientId;
+                    clientSecret = c.clientSecret;
+                    break;
+                }
+            } catch { /* skip */ }
+        }
+
+        if (tokenContent && clientId) {
+            // Read pool config to find proxy cred file path
+            const poolPath = path.join(rootDir, 'configs', 'provider_pools.json');
+            if (fs.existsSync(poolPath)) {
+                const pool = JSON.parse(fs.readFileSync(poolPath, 'utf8'));
+                const providers = pool['claude-kiro-oauth'];
+                if (providers && providers.length > 0) {
+                    for (const provider of providers) {
+                        const credRelPath = provider.KIRO_OAUTH_CREDS_FILE_PATH;
+                        if (!credRelPath) continue;
+                        const credPath = path.resolve(rootDir, credRelPath);
+                        if (fs.existsSync(credPath)) {
+                            const existing = JSON.parse(fs.readFileSync(credPath, 'utf8'));
+                            const merged = {
+                                ...existing,
+                                accessToken: tokenContent.accessToken,
+                                refreshToken: tokenContent.refreshToken,
+                                expiresAt: tokenContent.expiresAt,
+                                clientId,
+                                clientSecret
+                            };
+                            if (tokenContent.profileArn) merged.profileArn = tokenContent.profileArn;
+                            fs.writeFileSync(credPath, JSON.stringify(merged, null, 2), 'utf8');
+                            logger.info('[Master] Synced Kiro token from ' + tokenName + ' (expires: ' + tokenContent.expiresAt + ')');
+                        }
+                    }
+
+                    // Step 2: Reset health status for all kiro providers
+                    let poolChanged = false;
+                    for (const provider of providers) {
+                        if (provider.isHealthy === false) {
+                            provider.isHealthy = true;
+                            poolChanged = true;
+                        }
+                        if (provider.errorCount > 0) {
+                            provider.errorCount = 0;
+                            poolChanged = true;
+                        }
+                        if (provider.needsRefresh) {
+                            provider.needsRefresh = false;
+                            poolChanged = true;
+                        }
+                        if (provider.refreshCount > 0) {
+                            provider.refreshCount = 0;
+                            poolChanged = true;
+                        }
+                    }
+                    if (poolChanged) {
+                        fs.writeFileSync(poolPath, JSON.stringify(pool, null, 2), 'utf8');
+                        logger.info('[Master] Reset provider health status in provider_pools.json');
+                    }
+                }
+            }
+        } else {
+            logger.info('[Master] No valid Kiro IDE source token found, skipping sync');
+        }
+    } catch (e) {
+        logger.warn('[Master] Kiro credential sync failed: ' + e.message);
+    }
+}
+
+async function startWorker() {
     if (workerProcess) {
         logger.info('[Master] Worker process already running, PID:', workerProcess.pid);
         return;
+    }
+
+    // Sync Kiro credentials from IDE source before starting worker
+    try {
+        await syncKiroCredentials();
+    } catch (e) {
+        logger.warn('[Master] Pre-start credential sync failed:', e.message);
     }
 
     logger.info('[Master] Starting worker process...');
@@ -68,13 +180,13 @@ function startWorker() {
 
     logger.info('[Master] Worker process started, PID:', workerProcess.pid);
 
-    // 监听子进程消息
+    // 监听子进程消�?
     workerProcess.on('message', (message) => {
         logger.info('[Master] Received message from worker:', message);
         handleWorkerMessage(message);
     });
 
-    // 监听子进程退出
+    // 监听子进程退�?
     workerProcess.on('exit', (code, signal) => {
         logger.info(`[Master] Worker process exited with code ${code}, signal ${signal}`);
         workerProcess = null;
@@ -87,14 +199,14 @@ function startWorker() {
         }
     });
 
-    // 监听子进程错误
+    // 监听子进程错�?
     workerProcess.on('error', (error) => {
         logger.error('[Master] Worker process error:', error.message);
     });
 }
 
 /**
- * 停止子进程
+ * 停止子进�?
  * @param {boolean} graceful - 是否优雅关闭
  * @returns {Promise<void>}
  */
@@ -114,7 +226,7 @@ function stopWorker(graceful = true) {
                 workerProcess.kill('SIGKILL');
             }
             resolve();
-        }, 5000); // 5秒超时后强制杀死
+        }, 5000); // 5秒超时后强制杀�?
 
         workerProcess.once('exit', () => {
             clearTimeout(timeout);
@@ -125,7 +237,7 @@ function stopWorker(graceful = true) {
         });
 
         if (graceful) {
-            // 发送优雅关闭信号
+            // 发送优雅关闭信�?
             workerProcess.send({ type: 'shutdown' });
             workerProcess.kill('SIGTERM');
         } else {
@@ -135,7 +247,7 @@ function stopWorker(graceful = true) {
 }
 
 /**
- * 重启子进程
+ * 重启子进�?
  * @returns {Promise<Object>}
  */
 async function restartWorker() {
@@ -156,6 +268,14 @@ async function restartWorker() {
         // 等待一小段时间确保端口释放
         await new Promise(resolve => setTimeout(resolve, config.restartDelay));
         
+        // Sync Kiro credentials from IDE source before restarting worker
+        try {
+            await syncKiroCredentials();
+            logger.info('[Master] Credential sync completed before restart');
+        } catch (syncError) {
+            logger.warn('[Master] Credential sync failed before restart:', syncError.message);
+        }
+
         startWorker();
         workerStatus.isRestarting = false;
 
@@ -176,7 +296,7 @@ async function restartWorker() {
 }
 
 /**
- * 计划重启（用于崩溃后自动重启）
+ * 计划重启（用于崩溃后自动重启�?
  */
 function scheduleRestart() {
     if (workerStatus.restartCount >= config.maxRestartAttempts) {
@@ -216,7 +336,7 @@ function handleWorkerMessage(message) {
 }
 
 /**
- * 获取状态信息
+ * 获取状态信�?
  * @returns {Object}
  */
 function getStatus() {
@@ -238,7 +358,7 @@ function getStatus() {
 }
 
 /**
- * 创建主进程管理 HTTP 服务器
+ * 创建主进程管�?HTTP 服务�?
  */
 function createMasterServer() {
     const server = http.createServer(async (req, res) => {
@@ -246,7 +366,7 @@ function createMasterServer() {
         const path = url.pathname;
         const method = req.method;
 
-        // 设置 CORS 头
+        // 设置 CORS �?
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -257,7 +377,7 @@ function createMasterServer() {
             return;
         }
 
-        // 状态端点
+        // 状态端�?
         if (method === 'GET' && path === '/master/status') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(getStatus()));
@@ -296,7 +416,7 @@ function createMasterServer() {
             return;
         }
 
-        // 健康检查
+        // 健康检�?
         if (method === 'GET' && path === '/master/health') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
@@ -368,7 +488,7 @@ function setupSignalHandlers() {
 }
 
 /**
- * 主函数
+ * 主函�?
  */
 async function main() {
     logger.info('='.repeat(50));
@@ -381,14 +501,14 @@ async function main() {
     // 设置信号处理
     setupSignalHandlers();
 
-    // 创建管理服务器
+    // 创建管理服务�?
     createMasterServer();
 
-    // 启动子进程
+    // 启动子进�?
     startWorker();
 }
 
-// 启动主进程
+// 启动主进�?
 main().catch(error => {
     logger.error('[Master] Failed to start:', error);
     process.exit(1);
